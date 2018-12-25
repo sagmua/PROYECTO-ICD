@@ -1,0 +1,748 @@
+---
+title: "Trabajo Introducción Ciencia de Datos"
+author: "Samuel Cardenete Rodríguez"
+date: "19/12/2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#Librerías a utilizar:
+library(corrplot)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(e1071)
+library(gridExtra)
+require(caret)
+library(class)
+
+require(reshape2)
+
+
+require(MASS)
+require(kknn)
+set.seed(10)
+
+
+
+```
+# 1. Regresión
+
+Realizaremos las tareas de análisis exploratorio de datos, preprocesamiento, obtención de modelos y validación para un conjunto
+de datos de regresión.
+
+## Análisis exploratorio de datos y preprocesamiento
+
+Nuestro conjunto de datos para regresión es \textbf{Wizmir}.
+Contiene valores meteorológicos de Izmir desde el 01/01/1994 al 31/12/1997.
+
+Realicemos para comenzar la lectura de los datos y obtendremos un resumen sobre como están distribuidas las variables, que tipo de datos etc.
+
+
+```{r cars}
+wizmir_data = read.csv("./Datasets Regresion/wizmir/wizmir.dat", comment.char = "@", header = FALSE)
+names(wizmir_data) <- c("Max_temperature", "Min_temperature", "Dewpoint", "Precipitation", "Sea_level_pressure", "Standard_pressure", "Visibility", "Wind_speed", "Max_wind_speed", "Mean_temperature")
+
+nrow(wizmir_data)
+summary(wizmir_data)
+```
+En nuestro caso vemos que se tratan todos de valores continuos, y tenemos en total 1461 instancias de datos meteorológicos. Además las temperaturas en Izmir están en grados Farenheit. En este caso lo que intentamos predecir es la temperatura media que habrá en función de los valores meteorológicos tomados.
+
+Comprobemos ahora si existen valores perdidos, y si existen valores duplicados dentro de nuestro conjunto:
+
+```{r}
+anyNA(wizmir_data)
+anyDuplicated(wizmir_data)
+```
+En nuestro caso nuestro conjunto no posee valores perdidos, por tanto no tendremos que realizar ningún tratamiento de ellos, pero si que posee valores duplicados, concretamente uno. Por tanto eliminaremos la instancia duplicada para que no exista redundancia que afecte al rendimiento de nuestro futuro modelo de regresión.
+
+```{r}
+wizmir_data = unique(wizmir_data)
+```
+
+
+Realicemos ahora un pequeño estudio sobre las distribuciones de las variables del conjunto de datos, para ver como se distribuye su densidad y si siguen alguna distribución cercana a la normal :
+```{r}
+
+
+wizmir_data  %>% 
+  gather() %>% ggplot(aes(value)) + facet_wrap(~ key, scales = "free") +
+  geom_histogram(aes(y = ..density..), fill = 'red', alpha = 0.5) + 
+       geom_density(colour = 'blue') + xlab(expression(bold('Wizmir data'))) + 
+       ylab(expression(bold('Density')))
+```
+
+
+Como podemos observar en el gráfico, algunas variables como *Sea_level_preassure* se aproximan bastante a una distribución normal.
+
+En cambio, podemos ver que existe oblicuidad negativa en las variable *Dewpoint* y *Standard_preasure*:
+```{r}
+print("Oblicuidad de la variable Dewpoint:")
+skewness(wizmir_data$Dewpoint)
+print("Oblicuidad de la variable Standard Preasure")
+skewness(wizmir_data$Standard_pressure)
+```
+Probemos a reducir dicha oblicuidad realizando una transformación cuadrática de las variables anteriores:
+
+```{r}
+print("Oblicuidad transformacion cuadrática Dewpoint:")
+skewness(wizmir_data$Dewpoint^2)
+
+print("Oblicuidad transformacion cuadrática Standard Preassure:")
+skewness(wizmir_data$Standard_pressure^2)
+
+wizmir_data$Dewpoint = wizmir_data$Dewpoint^2
+wizmir_data$Standard_pressure = wizmir_data$Standard_pressure^2
+```
+Como podemos observar, hemos mejorado bastante la oblicuidad, ahora más cercana a 0 que anteriormente. Además también vemos en una oblicuidad positiva en la variable *Wind_speed*, por tanto probemos a aplicar una transformación logarítmica par intentar majorar la oblicuidad:
+
+```{r}
+print("Oblicuidad Wind Speed:")
+skewness(wizmir_data$Wind_speed)
+
+print("Oblicuidad transformacion logarítmica Wind Speed:")
+skewness(log(wizmir_data$Wind_speed))
+
+wizmir_data$Wind_speed = log(wizmir_data$Wind_speed)
+```
+Hemos mejorado más del doble la oblicuidad, obteniendo tras la transformación una ligera oblicuidad negativa. Hagamos una nueva representación ahora de las distribuciones de estas nuevas variables transformadas:
+
+
+```{r}
+wizmir_data_scaled=as.data.frame(scale(wizmir_data, center = TRUE, scale = TRUE))
+
+wizmir_data[c("Wind_speed", "Dewpoint", "Standard_pressure")]  %>% 
+  gather() %>% ggplot(aes(value)) + facet_wrap(~ key, scales = "free") +
+  geom_histogram(aes(y = ..density..), fill = 'red', alpha = 0.5) + 
+       geom_density(colour = 'blue') + xlab(expression(bold('Wizmir data'))) + 
+       ylab(expression(bold('Density')))
+```
+
+Como hipótesis principales podríamos pensar que los valores meteorológicos de la temperatura mínima y máxima alcanzada van a ser fundamentales para poder predecir la temperatura media.
+
+Realizamos ahora una previsualización de las variables entre sí respecto a la variable de salida para apoyar nuestra hipótesis primera un poco más:
+```{r}
+temp <- wizmir_data
+plotY <- function (x,y) {
+plot(temp[,y]~temp[,x], xlab=paste(names(temp)[x]," X",x,sep=""), ylab=names(temp)[y])
+}
+par(mfrow=c(3,4))
+x <- sapply(1:(dim(temp)[2]-1), plotY, dim(temp)[2]) 
+par(mfrow=c(1,1))  
+```
+Como podemos observar en un primer análisis de las gráficas, vemos que hay dos variables relacionadas de forma directamente proporcinal con la variable objetivo. Estas son para nuestra "sorpresa" *Min_temperature* y *Max_temperature*; como vemos a mayor temperatura máxima/mínima mayor temperatura media, y a menor temperatura mínima/máxima menor temperatura media obtenemos. Por tanto escogeremos estas dos como predictores relevantes. 
+
+También observamos dicha tendencia con la variable *Dewpoint* que nos indica la temperatura de condensación del agua formando rocío, que en principio no habíamos percibido. Por tanto inicialmente podemos pensar en que se trata también de un predictor relevante.
+
+Además con el predictor *Sea_level_pressure* observamos una tendencia inversamente proporcional entre esta y la variable salida, de forma que a mayor presión al nivel del mar, menor temperatura media hay.
+
+Para asegurarnos de si estas afirmaciones que hacemos apriori son ciertas realicemos un estudio de la correlación entre variables de nuestro dataset. Para ello realizamos una representación gráfica de las correlaciones entre las variables, de forma que a mayor amplitud del círculo mayor correlación existe, los colores fríos indican correlación directa y los calientes inversa:
+
+```{r}
+corrplot(cor(wizmir_data))
+```
+
+
+Como podemos ver, las afirmaciones que hemos realizado antes sobre la correlación entre *Max_temperature*, *Min_temperature*, *Dewpoint* y *Sea_level_preasure* con la variable salida *Mean_temperature* se confirman en el gráfico.
+
+Además como vemos *Visibility* y *Min_temperature* estan considerablemente correladas entre sí, y esta última hemos deducido anteriormente tambíen que era un posible buen regresor, por tanto probaremos también a generar un modelo para cada uno de los cinco regresores que hemos seleccionado:
+
+## Regresión lineal
+
+
+```{r}
+fit_max_temp =lm(Mean_temperature~Max_temperature,data=wizmir_data)
+summary(fit_max_temp)
+
+fit_min_temp =lm(Mean_temperature~Min_temperature,data=wizmir_data)
+summary(fit_min_temp)
+
+fit_sea_level_pres = lm(Mean_temperature~Sea_level_pressure,data=wizmir_data)
+summary(fit_sea_level_pres)
+
+fit_dewpoint = lm(Mean_temperature~Dewpoint,data=wizmir_data)
+summary(fit_dewpoint)
+
+fit_visibility = lm(Mean_temperature~Visibility, data = wizmir_data)
+summary(fit_visibility)
+
+```
+
+Como observamos, en los cinco modelos lineales obtenidos obtenemos un p-value en todos los casos menor que 2.2e-16.
+ Por tanto podemos decir con un (1 - 2.2e-16) x 100\% de confianza, o lo que es lo mismo, un 99\% de confianza de que el regresor tiene relevancia en su correspondiente modelo. Además el segundo p-value de F-statistic nos indica con un 1 - *p-value* de confianza si alguna de las variables empleadas en el modelo es dependiente con la variable de salida; en este caso, como nuestros modelos únicamente poseen un regresor, el p-value del regresor coincide con el p-value del F-statistic del regresor.
+ 
+Por otra parte, el modelo a seleccionar entre los cinco sería el primero modelo obtenido con el regresor *Max_temperature*, puesto que obtenemos un error cuadrático ajustado de 0.9576.
+
+
+Probemos ahora a la generación de un modelo de regresión lineal múltiple.
+
+
+## Regresión lineal múltiple
+
+Una forma de realizar la búsqueda de un buen modelo de regresión lineal múltiple consiste en generar primero un modelo con todos los regresores de nuestro conjunto de datos, e ir eliminando regresores en función de la calidad de los mismos de forma que vayamos obteniendo modelos cada vez más simples hasta encontrar el que se adapte mejor a nuestras necesidades o las del cliente:
+
+
+```{r}
+lm_all = lm(formula = Mean_temperature ~. , data = wizmir_data)
+summary(lm_all)
+```
+
+Como podemos observar al construir un primer modelo con todas los regresores obtenemos un adjusted R-squared de 0.99, por lo que nuestro modelo es capaz de predecir la temperatura media con casi toda la precisión posible. Esto nos deja en una situación en la cuál a partir de ahora más que buscar mejorar la capacidad predictora, buscaremos simplificar nuestro modelo sin perder mucho poder de predicción. Comencemos eliminando aquellos predictores con un p-value superior a 0.1:
+
+```{r}
+fit1 = lm(formula = Mean_temperature ~ . -Precipitation - Standard_pressure - Wind_speed,
+          data = wizmir_data)
+summary(fit1)
+```
+Acabamos de obtener un nuevo modelo, que posee la misma capacidad de predicción que el anterior, pero hemos eliminado tres variables que apriori parecen irrelevantes puesto que obtenemos el mismo error, con la ventaja de que hemos simplificado el modelo actual. Sigamos podando variables:
+
+```{r}
+fit2 = lm(formula = Mean_temperature ~ Max_temperature + Min_temperature, data = wizmir_data)
+summary(fit2)
+```
+
+Si nos quedamos con las dos variables que nos indican la temperatura mínima y máxima tomadas, podemos ver que nuestro acierto sigue siendo de 0.99, por lo que hemos obtenido un modelo muy simple, lo que lo hace facilmente interpretable, y con una capacidad de predicción casi perfecta.
+
+Respecto a la interpretabilidad, podemos ver que apartir de la temperatura mínima y máxima podemos predecir la media, lo cuál nos parece más que razonable, puesto que la temperatura media, por lo normal, va a estar situada la mayoría de las veces en el medio del intervalo [temperatura_min - temperatura_max], portanto la temperatura media, será muy cercana a la temperatura que resulta de calcular la media de la mínima y la máxima. 
+
+
+## Interacciones y no linealidad
+
+Visto lo anterior, tiene mucho sentido intentar construir un modelo lineal múltiple con interacciones entre *Max_temperature* y *Min_temperature*:
+
+```{r}
+fit_no_lineal = lm(Mean_temperature ~ Min_temperature * Max_temperature, data = wizmir_data)
+summary(fit_no_lineal)
+```
+
+Como podemos observar, obtenemos un buen error ajustado pero el estadístico nos indica con poca confianza en la relevancia de dicho predictor (min_temp*max_temp).
+
+Probemos ahora a generar un modelo con *Max_temperature* y *Sea_level_preasure*, puesto que también existe relación entre ellos dos:
+```{r}
+fit_no_lineal = lm(Mean_temperature ~ Sea_level_pressure * Max_temperature, data = wizmir_data)
+summary(fit_no_lineal)
+```
+Como podemos observar, obtenemos un buen error cuadrádico ajustado de 0.96, además de obtener en el estadístico un p-value inferior a 0.01
+por lo que tenemos una confianza de 99.99\% de que ese predictor es relevante.
+
+Probemos ahora a generar un modelo con no linealidad. Para ello comenzamos el mejor regresor de los modelos simples que hemos generado:
+
+```{r}
+fit_no_lineal = lm(Mean_temperature ~ I(Max_temperature^2) + I(Min_temperature^2) + Max_temperature + Min_temperature, data = wizmir_data)
+summary(fit_no_lineal)
+```
+Como vemos obtenemos un error similar al que obtenemos con un modelo lineal múltiple de dos regresores, por tanto, no tiene mucho sentido que eligiéramos este modelo puesto que obteniendo los mismos resultados, al ser un modelo no lineal, perdemos interpretabilidad.
+
+
+## Modelo Knn
+
+
+Vamos a generar ahora un modelo basado en Knn. Emplearemos el número de 7 vecinos cercanos, como kernel, seleccionaremos el óptimo.
+Antes de usar el Knn es necesario normalizar nuestros datos.
+```{r}
+#Construimos el modelo:
+fitknn = kknn(Mean_temperature ~Max_temperature, wizmir_data, wizmir_data, scale = TRUE)
+summary(fitknn)
+```
+
+```{r}
+
+
+  plot(wizmir_data$Mean_temperature~wizmir_data$Max_temperature)
+	points(wizmir_data$Max_temperature,fitknn$fitted.values,col="blue",pch=20)
+
+
+  calculo_rmse = function(modelo, datos){
+    sqrt(sum((datos$Mean_temperature-modelo$fitted.values)^2)/length(modelo$fitted.values)) #RMSE
+  }
+	
+calculo_rmse(fitknn, wizmir_data)
+```
+
+Obtenemos una raíz del error cuadrático medio cercana a cero, pero no podemos afirmar que sea un buen modelo puesto que las pruebas las estamos realizando calculando el error sobre el conjunto de entrenamiento, lo que no es nada fiable. Para solucionar este problema vamos a realizar una validación cruzada para obtener un valor más real del error obtenido, en este caso empleando todos los regresores:
+
+
+
+
+```{r}
+nombre <- "./Datasets Regresion/wizmir/wizmir"
+	run_knn_fold <- function(i, x, tt = "test") {
+  		file <- paste(x, "-5-", i, "tra.dat", sep="")
+		x_tra <- read.csv(file, comment.char="@")
+		file <- paste(x, "-5-", i, "tst.dat", sep="")
+		x_tst <- read.csv(file, comment.char="@")
+		In <- length(names(x_tra)) - 1
+		names(x_tra)[1:In] <- paste ("X", 1:In, sep="")
+		names(x_tra)[In+1] <- "Y"
+		names(x_tst)[1:In] <- paste ("X", 1:In, sep="")
+		names(x_tst)[In+1] <- "Y"
+		if (tt == "train") {
+			test <- x_tra
+		}
+		else {
+			test <- x_tst
+  		}
+		fitMulti=kknn(Y~.,x_tra,test)
+		yprime=fitMulti$fitted.values
+		sum(abs(test$Y-yprime)^2)/length(yprime) ##MSE
+	}
+	knnMSEtrain<-mean(sapply(1:5,run_knn_fold,nombre,"train"))
+	knnMSEtest<-mean(sapply(1:5,run_knn_fold,nombre,"test"))
+	
+	print("error train: ")
+	knnMSEtrain
+	print("error test: ")
+	knnMSEtest
+```
+
+Como vemos ahora obtenemos un error mayor que el obtenido anteriormente. Esto es debido a que ahora estamos generando un modelo con una partición sobre el conjunto de datos original y validándolo con otra partición diferente. Calculemos ahora mediante validación cruzada también el mejor modelo lineal multiple obtenido anteriormente, *Min_temperature* con *Max_temperature*:
+
+```{r}
+nombre <- "./Datasets Regresion/wizmir/wizmir"
+run_lm_fold <- function(i, x, tt = "test") {
+	file <- paste(x, "-5-", i, "tra.dat", sep=""); x_tra <- read.csv(file, comment.char="@")
+	file <- paste(x, "-5-", i, "tst.dat", sep=""); x_tst <- read.csv(file, comment.char="@")
+	In <- length(names(x_tra)) - 1
+	names(x_tra)[1:In] <- paste ("X", 1:In, sep=""); names(x_tra)[In+1] <- "Y"
+	names(x_tst)[1:In] <- paste ("X", 1:In, sep=""); names(x_tst)[In+1] <- "Y"
+	if (tt == "train") { test <- x_tra }
+	else { test <- x_tst }
+	fitMulti=lm(Y~X1+X2,x_tra)
+	yprime=predict(fitMulti,test)
+	sum(abs(test$Y-yprime)^2)/length(yprime) ##MSE
+}
+nuevolmMSEtrain<-mean(sapply(1:5,run_lm_fold,nombre,"train"))
+nuevolmMSEtest<-mean(sapply(1:5,run_lm_fold,nombre,"test"))
+
+print("error train: ")
+nuevolmMSEtrain
+print("error test: ")
+nuevolmMSEtest
+```
+
+Como podemos observar, los errores obtenidos por el modelo lineal son mejores que los obtenidos mediante Knn. Como conclusión podemos ver que no siempre es mejor emplear un modelo complejo para el cálculo de los errores descartando los simples, como hemos visto el modelo lineal es el que mejor se ajusta y predice a la variable salida.
+
+
+## Test de comparativas
+Antes de realizar las comparativas entre los algoritmos no pueden existir consideraciones específicas para cada problema (LM se ejecuta de forma genérica con todas las variables para cada problema), por tanto realizamos ahora una cross validation nueva para lm:
+
+```{r}
+nombre <- "./Datasets Regresion/wizmir/wizmir"
+run_lm_fold <- function(i, x, tt = "test") {
+	file <- paste(x, "-5-", i, "tra.dat", sep=""); x_tra <- read.csv(file, comment.char="@")
+	file <- paste(x, "-5-", i, "tst.dat", sep=""); x_tst <- read.csv(file, comment.char="@")
+	In <- length(names(x_tra)) - 1
+	names(x_tra)[1:In] <- paste ("X", 1:In, sep=""); names(x_tra)[In+1] <- "Y"
+	names(x_tst)[1:In] <- paste ("X", 1:In, sep=""); names(x_tst)[In+1] <- "Y"
+	if (tt == "train") { test <- x_tra }
+	else { test <- x_tst }
+	fitMulti=lm(Y~.,x_tra)
+	yprime=predict(fitMulti,test)
+	sum(abs(test$Y-yprime)^2)/length(yprime) ##MSE
+}
+nuevolmMSEtrain<-mean(sapply(1:5,run_lm_fold,nombre,"train"))
+nuevolmMSEtest<-mean(sapply(1:5,run_lm_fold,nombre,"test"))
+
+print("error train: ")
+nuevolmMSEtrain
+print("error test: ")
+nuevolmMSEtest
+```
+
+Realicemos ahora una tabla comparativa donde ejecutemos los algoritmos de regresión lineal (lm), vecino más cercano (knn) y M5'.
+Para ello calculamos el error cuadrático medio (MSE) de los tres modelos en el conjunto de entrenamiento y en el conjunto de test:
+
+```{r}
+#Leemos el csv con los datos:
+tabla_train = read.csv("regr_train_alumnos.csv")
+tabla_test = read.csv("regr_test_alumnos.csv")
+#Sustituimos nuestros valores obtenidos MSE mediante k-fold validation:
+tabla_train[tabla_train$X == "wizmir",2:3] = c(nuevolmMSEtrain, knnMSEtrain)
+tabla_test[tabla_test$X == "wizmir",2:3] = c(nuevolmMSEtest, knnMSEtest)
+
+```
+
+La nueva tabla de Train obtenida con nuestros datos:
+```{r}
+format(tabla_train, scientific=F )
+```
+
+y la nueva de Test:
+```{r}
+format(tabla_test, scientific=F )
+```
+
+
+Una vez que tenemos las tablas de los datos obtenidos en todos los conjuntos, vamos a realizar una comparativa entre el algoritmo Knn y lm mediante *Wilconx*.
+
+Realizamos antes una normalización de los datos, puesto que estamos trabajando en regresión:
+```{r}
+difs = (tabla_test[,"out_test_kknn"] - tabla_test[,"out_test_lm"])/tabla_test[, "out_test_kknn"]
+```
+Si es 0 la diferencia sumamos 0.1 puesto que wilcox falla con valores iguales a 0
+```{r}
+wilc_kknn_lm = cbind(ifelse (difs<0, abs(difs)+0.1, 0+0.1), ifelse (difs>0, abs(difs)+0.1, 0+0.1))
+colnames(wilc_kknn_lm) = c("score_kknn", "score_lm")
+```
+
+Ahora aplicamos el test y obtenemos los resultados:
+```{r}
+KNNvsLM = wilcox.test(wilc_kknn_lm[,1], wilc_kknn_lm[,2], alternative = "two.sided", paired=TRUE)
+Rmas = KNNvsLM$statistic
+pvalue = KNNvsLM$p.value
+
+KNNvsLM = wilcox.test(wilc_kknn_lm[,2], wilc_kknn_lm[,1], alternative = "two.sided", paired=TRUE)
+Rmenos = KNNvsLM$statistic
+pvalue = KNNvsLM$p.value
+
+resultados = matrix(c(Rmas, Rmenos, pvalue), 1, 3, byrow = TRUE)
+resultados = as.data.frame(resultados)
+colnames(resultados) =  colnames = c("R+", "R-", "p-value")
+
+resultados
+```
+Como podemos observar, obtenemos un R+ de 107 y un R- de 64. Pero si analizamos el p-value del estadístico obtenido, tenemos un (1- p-value)*100 de confianza de que son distintos, es decir, un 36.92\% de confianza de que son distintos, por tanto no podemos afirmar que existan diferencias significativas entre ambos.
+
+Realicemos ahora una comparativa múltiple entre los tres algoritmos knn, lm y M5P empleando Friedman y Holms. En este caso no hace falta realizar una normalización de los datos:
+```{r}
+test_friedman = friedman.test(as.matrix(tabla_test))
+test_friedman
+```
+Como vemos obtenemos un p-value menor que 0.05, por tanto podemos rechazar la hipótesis nula, y podemos concluir con un (1-pvalue)*100, o lo que es lo mismo, con un 99\% de confianza que existe una diferencia significativa entre al menos un par de algoritmos.
+
+
+Procedamos ahora con Holm:
+```{r}
+tabla_test = tabla_test[,-1]
+tam = dim(tabla_test)
+groups = rep(1:tam[2], each=tam[1])
+pairwise.wilcox.test(as.matrix(tabla_test), groups, p.adjust = "holm", paired = TRUE)
+```
+Como podemos observar mediante los p-values obtenidos, existen diferencias significativas a favor de M5', en 3 vs 1 0.081 y 3 vs 2 con 0.108 con aproximadamente un 90\% de confianza. Por otro lado LM y KKNN pueden ser considerados equivalentes.
+
+
+
+
+
+# Clasificación
+
+Realizaremos las tareas de análisis exploratorio de datos, preprocesamiento, obtención de modelos y validación para un conjunto de datos de clasificación.
+
+## Análisis exploratorio de datos y preprocesamiento
+
+Nuestro conjunto de datos para regresión es Newthyroid. Dicho data set contiene medidores clínicos de pacientes y el objetivo es detectar si un paciente está normal (1), posee hipertiroidismo (2), o hipotiroidismo (3).
+
+```{r}
+
+newthyroid_data = read.csv("./Datasets Clasificacion/newthyroid/newthyroid.dat", comment.char = "@", header = FALSE)
+names(newthyroid_data) <- c("T3resin", "Thyroxin", "Triiodothyronine", "Thyroidstimulating", "TSH_value", "Class")
+
+
+
+nrow(newthyroid_data)
+summary(newthyroid_data)
+```
+
+En nuestro caso vemos que se tratan todos de valores continuos, y tenemos en total 215 instancias de datos de pacientes. Además el tipo de enfermedad tiroidal se encuentra en valores numéricos, tipo 1, 2 y 3.
+Comprobemos ahora si existen valores perdidos, y si existen valores duplicados dentro de nuestro conjunto:
+
+```{r}
+anyNA(newthyroid_data)
+anyDuplicated(newthyroid_data)
+```
+En nuestro caso nuestro conjunto no posee valores perdidos ni instancias duplicadas, por tanto no tendremos que realizar ningún tratamiento de ellos.
+
+Realicemos ahora un pequeño estudio sobre las distribuciones de las variables del conjunto de datos, para ver
+como se distribuye su densidad y si siguen alguna distribución cercana a la normal:
+
+```{r}
+newthyroid_data %>%
+gather() %>% ggplot(aes(value)) + facet_wrap(~ key, scales = "free") + 
+  geom_histogram(aes(y = ..density..), fill = 'red', alpha = 0.5) +
+geom_density(colour = 'blue') + xlab(expression(bold('Wizmir data'))) + 
+  ylab(expression(bold('Density')))
+```
+Si observamos, nuestra variable salida que nos indica el tipo de enfermedad tiroidal está claramente desbalanceada. Tenemos muchas instancias de individuos sanos (tipo 1) mientras que pocas de indiduos enfermos (tipo 2 y 3).
+
+```{r}
+table(newthyroid_data$Class)
+```
+Como posible solución a este desbalanceo podríamos aplicar un Under-samplig de la clase mayoritaria (tipo 1), lo cuál en este caso no sería muy productivo puesto que tenemos un conjunto de datos muy pequeño. Otra solución posible (aunque no se vaya a realizar) sería realizar un Over-sampling de las clases minoritarias.
+
+Además como podemos observar en el gráfico, algunas variables como *T3resin* y *Thyroxin* se aproximan bastante a una distribución normal.
+Aunque en esta segunda podemos observar una oblicuidad positiva, así como en las variables *Triiodothyronine* y *TSH_value*.
+
+Oblicuidad de la variable *Thyroxin*:
+```{r}
+skewness(newthyroid_data$Thyroxin)
+```
+Oblicuidad de la variable *Triiodothyronine*:
+```{r}
+skewness(newthyroid_data$Triiodothyronine)
+```
+Oblicuidad de la variable *TSH_value*:
+```{r}
+skewness(newthyroid_data$TSH_value)
+```
+Oblicuidad de la variable *Thyroidstimulating*:
+```{r}
+skewness(newthyroid_data$Thyroidstimulating)
+```
+
+
+Para solucionar estas oblicuidad podemos realizar transformaciones sobre nuestros clasificadores para desplazar la distribución de forma que reduzcamos la oblicuidad de las mismas. Para ello comencemos realizando una transformación de la raiz cuadrada sobre la variable *Thyroxin*, obteniendo un nuevo valor de skew:
+
+```{r}
+skewness((newthyroid_data$Thyroxin^(1/2)))
+newthyroid_data$Thyroxin = (newthyroid_data$Thyroxin^(1/2))
+```
+Como vemos reducimos casi a 0 la oblicuidad de *Thyroxin*.
+Ahora realicemos una transformación logarítmica sobre la variable *Triiodothyronine* y *Thyroidstimulating* y veamos como mejoran:
+```{r}
+skewness(log(newthyroid_data$Triiodothyronine))
+newthyroid_data$Triiodothyronine = log(newthyroid_data$Triiodothyronine)
+```
+
+```{r}
+newthyroid_data$Thyroidstimulating = log(newthyroid_data$Thyroidstimulating)
+skewness(newthyroid_data$Thyroidstimulating)
+```
+También reducimos la oblicuidad casi a 0 para *Triiodothyronine* mientras que con *Thyroidstimulating* también la reducimos drásticamente aunque no se acerque tanto a 0.
+
+Por último realicemos una transformación de raiz cúbica sobre la variable *TSH_value*:
+```{r}
+skewness(ifelse(newthyroid_data$TSH_value <0, -((-newthyroid_data$TSH_value)^(1/3)),
+                newthyroid_data$TSH_value^(1/3)))
+
+newthyroid_data$TSH_value = ifelse(newthyroid_data$TSH_value <0,
+                                  -((-newthyroid_data$TSH_value)^(1/3)),
+                                   newthyroid_data$TSH_value^(1/3))
+```
+En este caso hemos reducido un skew positivo de 4,2 en un skew negativo de -0.2.
+Realicemos una nueva representación de nuestros datos para observar las mejoras de forma visual:
+
+```{r}
+newthyroid_data %>%
+gather() %>% ggplot(aes(value)) + facet_wrap(~ key, scales = "free") + 
+  geom_histogram(aes(y = ..density..), fill = 'red', alpha = 0.5) +
+geom_density(colour = 'blue') + xlab(expression(bold('Newthyroid data'))) + 
+  ylab(expression(bold('Density')))
+```
+
+Como podemos observar los tres clasificadores que hemos transformado se aproximan más ahora a un a distribución normal.
+
+Realizamos ahora una representación de la densidad de las variables con respecto a la variable salida:
+
+
+```{r}
+newthyroid_data$Class = as.factor(newthyroid_data$Class)
+
+func = function(col){
+  ggplot(newthyroid_data, aes(x=col)) + geom_density(aes(group=Class, colour=Class, fill=Class), alpha=0.7) +labs(x=colnames(newthyroid_data)[which(newthyroid_data[1,colnames(newthyroid_data)]==col[1])])
+}
+
+plots = apply(newthyroid_data[,-6], 2,  func)
+
+
+do.call("grid.arrange", c(plots))
+ 
+```
+
+
+Como podemos observar en las gráficas, las variables donde las regiones de la variable salida se solapan menos son *Thiroxin* y *TSH_value*, por lo tanto como primera hipótesis que podemos hacer es que estas dos van a ser predictores representativos a la hora de construir los modelos de predicción. Si investigamos un poco descubirmos que la tiroxina, es el principal tipo de hormona tiroidea secretada por las células foliculares de la glándula tiroides, y la tirotropina (TSH) es una hormona producida por la hipófisis que regula la producción de hormonas tiroideas por la glándula tiroides. Por tanto el valor que estas dos tomen influirá mucho y estará muy relacionado con padecer o no una enfermedad tiroidal. Veamos ahora como se distribuyen dichas variables más detalladamente:
+
+```{r}
+ggplot(melt(newthyroid_data[,c(2,5,6)]), aes(x=variable, y = value)) + geom_boxplot()
+```
+
+en el caso de *Thyroxin* vemos que su media es representativa de la muestra debido a que casi coincide con la mediana. Por otro lado encontramos la presencia de bastantes *outliers* en ambas variables. La eliminación de los outliers no suele ser una buena medida de tratado puesto que puede que estos sean relevantes y significativos para la construcción del modelo asi que los dejaremos tal y como están.
+
+Veamos ahora un estudio de las correlaciones existentes entre las variables de nuestro dataset:
+
+```{r}
+copy = newthyroid_data
+copy$Class = as.numeric(newthyroid_data$Class)
+corrplot(cor(copy))
+```
+
+
+Como podemos ver, las variables *Thyroxin* y *TSH_value* se encuentran relativamente relacionadas con la clase a predecir, la primera de forma inversamente proporcional y la segunda de forma directa. Además ambas variables se encuentran altamente correladas, por tanto podríamos plantearnos reducir una de ellas puesto que la otra ya le representa pero debido a el número escaso de predictores que poseemos no lo haremos.
+
+Por otra parte vemos algo que se nos había pasado de largo anteriormente, vemos que la variable *Thyroidstimulating* se encuentra altamente correlacionada con la variable a predecir, por tanto también podrá ser considerado como un buen predictor para saber que tipo de enfermedad posee un paciente.
+
+## KNN clasificación
+
+Vamos ahora a utilizar el algoritmo Knn probando con diferentes valores de 'k' de forma que elegiremos el más adecuado para nuestro conjunto de datos. Para ejecutar knn es necesario escalar nuestro conjunto de datos:
+
+```{r}
+newthyroid_data[,-6]=as.data.frame(scale(newthyroid_data[,-6], center = TRUE, scale = TRUE))
+```
+
+
+Antes que nada, para poder realizar una correcta validación de los modelos para luego compararlos realizamos un particionado del conjunto de datos en conjunto de *train* y *test*. Empleamos un 80\% para *train* y un 20\% para *test*:
+
+```{r}
+porcentaje_80 = sample(nrow(newthyroid_data), trunc(0.8*nrow(newthyroid_data)))
+
+train = newthyroid_data[porcentaje_80,]
+test = newthyroid_data[-porcentaje_80,]
+
+train_labels = train$Class
+test_labels = test$Class
+```
+
+Generamos ahora los modelos con diferentes valores de k:
+
+```{r}
+precision = function(tabla){
+  (tabla[1,1] + tabla[2,2] )/ sum(tabla)
+}
+
+
+
+#Probamos diferentes modelos, k = 21, k = 10, k = 3, k = 1
+test_pred_k_21 <- knn(train = train, test = test, cl = train_labels, k=21)
+test_pred_k_10 <- knn(train = train, test = test, cl = train_labels, k=10)
+test_pred_k_3 <- knn(train = train, test = test, cl = train_labels, k=3)
+test_pred_k_1 <- knn(train = train, test = test, cl = train_labels, k=1)
+```
+Ahora evaluamos los modelos generados. Para ello emplearemos la precisión (accuracy) que consiste en el número de etiquetas verdaderas entre el número de etiquetas totales:
+
+Precision para k = 21:
+```{r}
+precision(table(test_pred_k_21,test_labels))
+```
+Precisión para k = 10:
+```{r}
+precision(table(test_pred_k_10,test_labels))
+```
+
+Precisión para k = 3:
+```{r}
+precision(table(test_pred_k_3,test_labels))
+```
+Precisión para k = 1:
+```{r}
+precision_k1= precision(table(test_pred_k_1,test_labels))
+precision_k1
+```
+Tras calcular la precisión de los cuatro modelos generados, podemos observar que aumentar el número de vecinos cercanos no siempre es buena opción, a veces un modelo empleando un sólo vencino cercano produce mejor precisión o la misma, como es nuestro caso, de forma que aumentar el número de vecinos puede hacer que se genere un modelo que esté sobreaprendiendo, lo cuál hará que cuando se utilice el conjunto *test* perderá poder de generalización.
+
+Por tanto elegiremos el modelo con un sólo vecino (k=1) por su precisión y además por la simplicidad.
+
+## Modelo con LDA
+Realicemos ahora un modelo basado en LDA (Lineal Discriminant Analysis). LDA se basa en el teorema de Bayes para la clasificación. LDA realiza una aproximación del clasificador de Bayes de forma que los parametros poblacionales se calculan mediante una estimación. 
+
+```{r}
+fit_all_lda = lda(formula =Class ~. , data = train)
+fit_all_lda
+```
+
+Como podemos ver si analizamos los coeficientes obtenidos en el modelo, como bian habíamos visto antes la variable *Thyroxin* es la mas relevante de todas a la hora del cálculo de la clase.
+
+Calculemos ahora la precisión del modelo:
+```{r}
+pred_lda_all = predict(fit_all_lda, test[,-6])
+precision_lda= precision(table(pred_lda_all$class,test_labels))
+precision_lda
+
+```
+Obtenemos un modelo cercano al Knn aunque con una precisión un poco inferior.
+
+## Modelo qda
+El clasificador Quadratic Discriminat Analysis (QDA) se asemeja en gran medida al LDA, con la única diferencia de que el QDA considera que cada clase k tiene su propia matriz de covarianza y, como consecuencia, la función discriminante toma forma cuadrática.
+
+Construyamos un modelo empleando también todos los predictores mediante QDA y veamos su rendimiento:
+```{r}
+fit_all_qda = qda(Class~., data = train)
+fit_all_qda
+```
+Y ahora calculamos el error en el conjunto *test*:
+```{r}
+pred_qda_all = predict(fit_all_qda, test[,-6])
+precision_qda= precision(table(pred_qda_all$class,test_labels))
+precision_qda
+```
+Como podemos observar, obtenemos una precisión en QDA mejor que cuando empleamos LDA en este caso.
+
+
+## Comparativa algoritmos
+
+Relicemos ahora una comparativa entre los tres algoritmos sobre los que hemos generado los modelos Knn, QDA y LDA.
+
+```{r}
+#Leemos el csv con los datos:
+tabla_test_clasif = read.csv("clasif_test_alumnos.csv")
+#Sustituimos nuestros valores obtenidos de precision para Newthyroid:
+tabla_test_clasif[tabla_test_clasif$X == "newthyroid",2:4] = c(precision_k1, precision_lda, precision_qda)
+```
+
+
+Una vez sustituidos nuestros datos obtenemos la siguiente tabla:
+```{r}
+tabla_test_clasif
+```
+
+Realicemos ahora una comparación de los tres algoritmos empleando los test de *Wilcoxon*, *Friedman* y *Holm*.
+
+Comencemos realizando el test de *Wilcoxon*; en este caso como nos encontramos en clasificación no es necesario normalizar los datos puesto que los valores de la precisión ya están normalizados en el rango [0-1]:
+
+
+```{r}
+LDAvsQDAtest = wilcox.test(tabla_test_clasif$out_test_lda,
+                           tabla_test_clasif$out_test_qda, alternative = "two.sided", paired = TRUE)
+Rmas = LDAvsQDAtest$statistic
+pvalue = LDAvsQDAtest$p.value
+
+QDAvsLDAtest = wilcox.test(tabla_test_clasif$out_test_qda,
+                           tabla_test_clasif$out_test_lda, alternative = "two.sided", paired = TRUE)
+Rmenos = QDAvsLDAtest$statistic
+
+resultados_lda_qda = matrix(c(Rmas, Rmenos, pvalue), 1, 3, byrow = TRUE)
+resultados_lda_qda = as.data.frame(resultados_lda_qda)
+colnames(resultados_lda_qda) = colnames = c("R+", "R-", "p-value")
+resultados_lda_qda
+```
+Como podemos observar, obtenemos un R+ de 108 y un R- de 102. Si analizamos el p-value del estadístico obtenido, tenemos un (1- p-value)x100 de confianza de que son distintos, es decir, un 17,3\% de confianza de que son distintos, por tanto no podemos afirmar que existan diferencias significativas entre ambos.
+Realicemos ahora una comparativa mediante múltiple entre los tres algoritmos knn, lda y qda empleando *Friedman* y *Holms.*:
+
+```{r}
+test_friedman = friedman.test(as.matrix(tabla_test_clasif)) 
+test_friedman
+```
+Para Friedmans obtenemos un p-value menor que 0.05, por tanto podemos rechazar la hipótesis nula, y podemos concluir con un (1-pvalue)x100, o lo que es lo mismo, con un 99% de confianza que existe una diferencia significativa entre al menos un par de algoritmos.
+
+Veamos por último mediante Holm:
+
+```{r}
+tabla_test_clasif = tabla_test_clasif[,-1]
+tam = dim(tabla_test_clasif)
+groups = rep(1:tam[2], each=tam[1])
+pairwise.wilcox.test(as.matrix(tabla_test_clasif), groups, p.adjust = "holm", paired = TRUE)
+```
+Como podemos observar, según holm existen diferencias significativas entre los tres algoritmos.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
